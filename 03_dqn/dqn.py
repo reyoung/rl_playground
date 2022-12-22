@@ -69,7 +69,7 @@ def exploration(frame: int) -> float:
     # 越早的frame增加探索的概率
     epsilon_start = 1.0
     epsilon_final = 0.01
-    epsilon_decay = 500
+    epsilon_decay = 1000
     return epsilon_final + (epsilon_start - epsilon_final) * math.exp(-1. * frame / epsilon_decay)
 
 
@@ -145,7 +145,7 @@ def main():
     state, _ = env.reset()
     episode_reward = 0
     losses = []
-    total_frames_to_train = 5000
+    total_frames_to_train = 50000
 
     for frame in range(total_frames_to_train):
         epsilon = exploration(frame)
