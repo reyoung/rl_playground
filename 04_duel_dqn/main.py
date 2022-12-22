@@ -1,12 +1,12 @@
 import dataclasses
-import math
-import random
-from collections import deque
-from typing import List, Optional
-import torch
 import gymnasium
-from gymnasium.utils.save_video import save_video
+import torch
+from typing import Optional, List
+import random
+import math
+from collections import deque
 import numpy
+from gymnasium.utils.save_video import save_video
 
 
 @dataclasses.dataclass()
@@ -53,7 +53,6 @@ class ReplayBuffer:
             actions.append(record.action)
             rewards.append(record.reward)
 
-
         return RecordBatch(
             state=torch.tensor(states, dtype=torch.float32, device="cuda:0"),
             next_state=torch.tensor(next_states, dtype=torch.float32, device="cuda:0"),
@@ -74,57 +73,63 @@ def exploration(frame: int) -> float:
     return epsilon_final + (epsilon_start - epsilon_final) * math.exp(-1. * frame / epsilon_decay)
 
 
-class DQN(torch.nn.Module):
-    def __init__(self, num_inputs: int, num_actions: int, rng: Optional[random.Random] = None):
+class DuelingDQN(torch.nn.Module):
+    def __init__(self, num_inputs: int, num_actions: int):
         super().__init__()
-        self.layers = torch.nn.Sequential(
+        self.base = torch.nn.Sequential(
             torch.nn.Linear(num_inputs, 128),
-            torch.nn.ReLU(),
+            torch.nn.ReLU()
+        )
+        self.advantage = torch.nn.Sequential(
             torch.nn.Linear(128, 128),
             torch.nn.ReLU(),
             torch.nn.Linear(128, num_actions)
         )
+        self.value = torch.nn.Sequential(
+            torch.nn.Linear(128, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 1),
+        )
+        self.rng = random.Random()
         self.num_actions = num_actions
-        if rng is None:
-            rng = random.Random()
-        self.rng = rng
 
-    def forward(self, state):
-        return self.layers(state)
+    def forward(self, state: torch.Tensor):
+        x = self.base(state)
+        advantage = self.advantage(x)
+        value = self.value(x)
+        return value + advantage - advantage.mean()
 
-    def act(self, state: List[float], explore_rate: float = 0) -> int:
-        """
-
-        :param state:
-        :param explore_rate: 探索概率
-        :return:
-        """
+    def act(self, state, explore_rate: float = 0) -> int:
         if self.rng.random() > explore_rate:
             with torch.no_grad():
-                state = torch.tensor([state], dtype=torch.float32, device="cuda:0")
-                result = self.layers(state)
-                result: torch.Tensor = result[0].argmax()
+                state = torch.tensor(state, dtype=torch.float32, device='cuda:0').unsqueeze(0)
+                q_value = self.forward(state)
+                result: torch.Tensor = q_value[0].argmax()
                 return result.item()
         else:
-            return self.rng.randint(0, self.num_actions - 1)
+            return random.randrange(self.num_actions)
 
 
-def do_learn(replay: ReplayBuffer, dqn: DQN, optimizer: torch.optim.Optimizer):
+def do_learn(replay: ReplayBuffer, cur_model: DuelingDQN, trg_model: DuelingDQN,
+             optimizer: torch.optim.Optimizer) -> torch.Tensor:
     gamma = 0.99
     batch_size = 128
     batch = replay.sample(batch_size=batch_size)
 
     # Q values 表示当前状态不同Action的期望收益
-    q_value = dqn(batch.state)
+    q_value = cur_model(batch.state)
     # 找到 action 的 q_value
     q_value = q_value.gather(1, batch.action.unsqueeze(1)).squeeze(1)
-    # next q values 表示下一个状态不同Action之间的期望收益
-    next_q_value = dqn(batch.next_state)
-    # find the max policy's Q value
-    next_q_value = next_q_value.max(1)[0]
 
-    # expected q value = current step reward + next_step q value excluding done.
-    expected_q_value = batch.reward + gamma * next_q_value * (1 - batch.done)
+    with torch.no_grad():
+        # next q values 表示下一个状态不同Action之间的期望收益
+        next_q_value = trg_model(batch.next_state)
+        # find the max policy's Q value
+        next_q_value = next_q_value.max(1)[0]
+
+        # expected q value = current step reward + next_step q value excluding done.
+        expected_q_value = batch.reward + gamma * next_q_value * (1 - batch.done)
+        expected_q_value = expected_q_value.detach()
 
     loss = (q_value - expected_q_value).pow(2).mean()
     optimizer.zero_grad()
@@ -135,22 +140,28 @@ def do_learn(replay: ReplayBuffer, dqn: DQN, optimizer: torch.optim.Optimizer):
 
 def main():
     env = gymnasium.make('CartPole-v1', render_mode="rgb_array")
-    model = DQN(env.observation_space.shape[0], env.action_space.n)
-    model.to("cuda:0")
+    current_model = DuelingDQN(env.observation_space.shape[0], env.action_space.n)
+    current_model.to("cuda:0")
+    target_model = DuelingDQN(env.observation_space.shape[0], env.action_space.n)
+    target_model.to("cuda:0")
 
-    optimizer = torch.optim.Adam(model.parameters())
+    def sync_model():
+        target_model.load_state_dict(current_model.state_dict())
 
-    replay = ReplayBuffer(1000)
+    sync_model()
+
+    optimizer = torch.optim.Adam(current_model.parameters())
+    replay = ReplayBuffer(400)
     replay_warmup = 200
 
     state, _ = env.reset()
     episode_reward = 0
     losses = []
     total_frames_to_train = 50000
-
+    episode_id = 0
     for frame in range(total_frames_to_train):
         epsilon = exploration(frame)
-        action = model.act(state, epsilon)
+        action = current_model.act(state, epsilon)
         next_state, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         replay.append(Record(next_state=next_state, state=state, reward=reward, done=done, action=action))
@@ -163,9 +174,12 @@ def main():
 
             losses.clear()
             episode_reward = 0
+            episode_id += 1
 
         if len(replay) > replay_warmup:
-            losses.append(do_learn(replay, model, optimizer).item())
+            losses.append(do_learn(replay, current_model, target_model, optimizer).item())
+            if frame % 200 == 0:
+                sync_model()
 
     # let's record some videos for trained model
 
@@ -174,7 +188,7 @@ def main():
     frames = []
     while True:
         frames.append(env.render())
-        action = model.act(state)
+        action = current_model.act(state)
         state, reward, terminated, truncated, info = env.step(action)
         if terminated or truncated:
             frames.append(env.render())
