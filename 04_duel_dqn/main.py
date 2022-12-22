@@ -112,6 +112,7 @@ class DuelingDQN(torch.nn.Module):
 
 def do_learn(replay: ReplayBuffer, cur_model: DuelingDQN, trg_model: DuelingDQN,
              optimizer: torch.optim.Optimizer) -> torch.Tensor:
+    use_one_model = False  # true only for testing. Test for disabling two model trick
     gamma = 0.99
     batch_size = 128
     batch = replay.sample(batch_size=batch_size)
@@ -121,15 +122,20 @@ def do_learn(replay: ReplayBuffer, cur_model: DuelingDQN, trg_model: DuelingDQN,
     # 找到 action 的 q_value
     q_value = q_value.gather(1, batch.action.unsqueeze(1)).squeeze(1)
 
-    with torch.no_grad():
-        # next q values 表示下一个状态不同Action之间的期望收益
-        next_q_value = trg_model(batch.next_state)
-        # find the max policy's Q value
+    if use_one_model:
+        next_q_value = cur_model(batch.next_state)
         next_q_value = next_q_value.max(1)[0]
-
-        # expected q value = current step reward + next_step q value excluding done.
         expected_q_value = batch.reward + gamma * next_q_value * (1 - batch.done)
-        expected_q_value = expected_q_value.detach()
+    else:
+        with torch.no_grad():
+            # next q values 表示下一个状态不同Action之间的期望收益
+            next_q_value = trg_model(batch.next_state)
+            # find the max policy's Q value
+            next_q_value = next_q_value.max(1)[0]
+
+            # expected q value = current step reward + next_step q value excluding done.
+            expected_q_value = batch.reward + gamma * next_q_value * (1 - batch.done)
+            expected_q_value = expected_q_value.detach()
 
     loss = (q_value - expected_q_value).pow(2).mean()
     optimizer.zero_grad()
