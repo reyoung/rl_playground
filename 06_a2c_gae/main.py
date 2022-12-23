@@ -37,16 +37,6 @@ class ActorCritic(torch.nn.Module):
             return action
 
 
-class ActionSpaceTransform(gymnasium.ActionWrapper):
-    def __init__(self, env: Env[ObsType, ActType]):
-        super().__init__(env)
-        self.action_space = gymnasium.spaces.Box(shape=(2,), dtype=numpy.float32, low=-1, high=1)
-
-
-    def action(self, action: WrapperActType) -> ActType:
-        return numpy.argmax(action)
-
-
 def compute_return(final_value: float, values: List[float],
                    rewards: List[SupportsFloat], masks: List[bool], gamma=0.99, tau=0.95) -> torch.Tensor:
     values = values + [final_value]
