@@ -135,6 +135,7 @@ def do_learn(replay: ReplayBuffer, dqn: DQN, optimizer: torch.optim.Optimizer):
 
 def main():
     env = gymnasium.make('CartPole-v1', render_mode="rgb_array")
+
     model = DQN(env.observation_space.shape[0], env.action_space.n)
     model.to("cuda:0")
 
@@ -168,7 +169,6 @@ def main():
             losses.append(do_learn(replay, model, optimizer).item())
 
     # let's record some videos for trained model
-
     state, _ = env.reset()
     episode = 0
     frames = []

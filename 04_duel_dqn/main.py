@@ -157,7 +157,7 @@ def main():
     sync_model()
 
     optimizer = torch.optim.Adam(current_model.parameters())
-    replay = ReplayBuffer(400)
+    replay = ReplayBuffer(1000)
     replay_warmup = 200
 
     state, _ = env.reset()
