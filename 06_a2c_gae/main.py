@@ -10,7 +10,7 @@ import tqdm
 
 
 class ActorCritic(torch.nn.Module):
-    def __init__(self, num_inputs: int, num_actions: int, std: float = 0.0):
+    def __init__(self, num_inputs: int, num_actions: int):
         super().__init__()
         self.actor = torch.nn.Sequential(
             torch.nn.Linear(num_inputs, 128),
@@ -41,6 +41,7 @@ class ActionSpaceTransform(gymnasium.ActionWrapper):
     def __init__(self, env: Env[ObsType, ActType]):
         super().__init__(env)
         self.action_space = gymnasium.spaces.Box(shape=(2,), dtype=numpy.float32, low=-1, high=1)
+
 
     def action(self, action: WrapperActType) -> ActType:
         return numpy.argmax(action)
