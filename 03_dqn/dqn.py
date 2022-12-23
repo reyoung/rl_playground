@@ -54,6 +54,7 @@ class ReplayBuffer:
             rewards.append(record.reward)
 
 
+
         return RecordBatch(
             state=torch.tensor(states, dtype=torch.float32, device="cuda:0"),
             next_state=torch.tensor(next_states, dtype=torch.float32, device="cuda:0"),
