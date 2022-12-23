@@ -1,4 +1,5 @@
 import dataclasses
+import time
 from typing import Tuple, SupportsFloat, Any, List, Dict, Callable, Optional
 import threading
 import gymnasium
@@ -90,7 +91,8 @@ class OptimizeThread:
         self.thread: Optional[threading.Thread] = None
         self.exited: Optional[threading.Event] = None
         self.job_queue = queue.Queue(maxsize=2)
-        self.thread.start()
+        if start:
+            self.start()
 
     def start(self):
         if self.thread is not None:
@@ -107,18 +109,39 @@ class OptimizeThread:
         self.exited = None
         self.thread = None
 
+    def post(self, req: UpdateRequest):
+        self.job_queue.put(req)
+
     def thread_main(self):
-        pass
+        while not self.exited.isSet():
+            try:
+                req: UpdateRequest = self.job_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            self.optimizer.zero_grad()
+
+            for param_name, param in self.model.named_parameters():
+                param.grad = req.gradients[param_name]
+
+            self.optimizer.step()
+
+            param_dict = {param_name: param.data for param_name, param in self.model.named_parameters()}
+            req.on_params_updated(param_dict)
 
 
-def main():
-    env = gymnasium.make('CartPole-v1', render_mode="rgb_array")
+def a2c_thread_impl(model, optimize_thread: OptimizeThread, n_batches: int, n_local_steps: int,
+                    log_enabled: Callable[[int], bool], stream: torch.cuda.Stream, enable_tqdm: bool):
+    env = gymnasium.make('CartPole-v1')
     env = gymnasium.wrappers.AutoResetWrapper(env)
-    model = ActorCritic(num_inputs=env.observation_space.shape[0], num_actions=env.action_space.n)
-    model.to("cuda:0")
-    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
 
-    for batch_id in tqdm.tqdm(range(5000), desc="batch"):
+    model.to("cuda:0")
+
+    batch_range = range(n_batches)
+    if enable_tqdm:
+        batch_range = tqdm.tqdm(batch_range, desc="batch")
+
+    for batch_id in batch_range:
         log_probs = []
         values = []
         rewards = []
@@ -126,7 +149,8 @@ def main():
         entropy = 0
 
         state, _ = env.reset()
-        for _ in range(1000):
+
+        for _ in range(n_local_steps):
             state = torch.tensor(state, dtype=torch.float32, device="cuda:0").unsqueeze(0)
             dist, value = model(state)
             action = dist.sample().squeeze(0)
@@ -138,46 +162,77 @@ def main():
             rewards.append(reward)
             done = terminated or truncated
             masks.append(not done)
-        values = torch.cat(values)
 
+        values = torch.cat(values)
         with torch.no_grad():
             _, value = model(torch.tensor(state, dtype=torch.float32, device="cuda:0").unsqueeze(0))
             returns = compute_return(value.item(), values.flatten().cpu().tolist(), rewards, masks)
 
         log_probs = torch.cat(log_probs)
         advantage = returns - values
-
         actor_loss = -(log_probs * advantage.detach()).mean()
         critic_loss = advantage.pow(2).mean()
         loss = actor_loss + 0.5 * critic_loss - 0.001 * entropy
-        optimizer.zero_grad()
+
+        # zero gradient
+        for p in model.parameters():
+            p.grad = None
+
         loss.backward()
-        optimizer.step()
-        if (batch_id + 1) % 100 == 0:
+        grad_dict = {param_name: param.grad.cpu() for param_name, param in model.named_parameters()}
+
+        value_updated = threading.Event()
+
+        def update_value(val_dict):
+            for param_name, param in model.named_parameters():
+                param.data.copy_(val_dict[param_name], non_blocking=True)
+
+            stream.synchronize()
+            value_updated.set()
+
+        optimize_thread.post(UpdateRequest(gradients=grad_dict, on_params_updated=update_value))
+        value_updated.wait()
+
+        if log_enabled(batch_id + 1):
             with torch.no_grad():
                 total_reward = test_env(env, model)
 
             print(f"batch {batch_id + 1}, total reward {total_reward} / 10 episodes")
 
-    # let's record some videos for trained model
-    state, _ = env.reset()
-    episode = 0
-    frames = []
-    while True:
-        frames.append(env.render())
-        action = model.act(state)
-        state, reward, terminated, truncated, info = env.step(action)
-        if terminated or truncated:
-            frames.append(env.render())
-            state, _ = env.reset()
-            save_video(frames,
-                       "videos",
-                       episode_trigger=lambda *args: True,
-                       episode_index=episode,
-                       fps=env.metadata['render_fps'])
-            episode += 1
-            if episode == 10:
-                break
+
+def a2c_thread_main(model: ActorCritic, optimize_thread: OptimizeThread, n_batches: int, n_local_steps: int,
+                    log_enabled: Callable[[int], bool], enable_tqdm: bool):
+    stream = torch.cuda.Stream(device="cuda:0")
+    with torch.cuda.stream(stream):
+        a2c_thread_impl(model, optimize_thread, n_batches, n_local_steps, log_enabled, stream, enable_tqdm)
+
+
+def main():
+    env = gymnasium.make('CartPole-v1', render_mode="rgb_array")
+    env = gymnasium.wrappers.AutoResetWrapper(env)
+
+    model = ActorCritic(num_inputs=env.observation_space.shape[0], num_actions=env.action_space.n)
+    optimize_thread = OptimizeThread(model=model, start=False)
+    env.close()
+
+    num_a2c_thread = 4
+    threads = []
+    for thread_id in range(num_a2c_thread):
+        tid = thread_id
+        th_model = ActorCritic(num_inputs=env.observation_space.shape[0], num_actions=env.action_space.n)
+        th_model.load_state_dict(model.state_dict())
+        thread = threading.Thread(target=a2c_thread_main, args=(th_model, optimize_thread,
+                                                                5000, 1000,
+                                                                lambda bid: bid % (100 * num_a2c_thread) == bid * 100,
+                                                                tid == 0
+                                                                ))
+        thread.start()
+        threads.append(thread)
+
+    optimize_thread.start()
+
+    for th in threads:
+        th.join()
 
 
 if __name__ == '__main__':
