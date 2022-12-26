@@ -41,6 +41,7 @@ class ActorCritic(torch.nn.Module):
 
 
 def compute_return(final_value: torch.Tensor, values, rewards, masks, gamma=0.99, tau=0.95) -> torch.Tensor:
+
     values = values + [final_value]
     values = torch.stack(values).squeeze(-1)
     n = len(rewards)
