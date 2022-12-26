@@ -74,31 +74,31 @@ def do_ppo_update(model, optimizer,
     n = stats.shape[0]
     ids = numpy.arange(n)
     numpy.random.shuffle(ids)
+    for _ in range(3):
+        for start in range(0, n, ppo_batch_size):
+            end = start + ppo_batch_size
+            to_train = ids[start: end]
 
-    for start in range(0, n, ppo_batch_size):
-        end = start + ppo_batch_size
-        to_train = ids[start: end]
+            state = stats[to_train, :]
+            action = actions[to_train, :]
+            old_log_prob = log_probs[to_train, :]
+            return_ = returns[to_train, :]
+            advantage = advantages[to_train, :]
 
-        state = stats[to_train, :]
-        action = actions[to_train, :]
-        old_log_prob = log_probs[to_train, :]
-        return_ = returns[to_train, :]
-        advantage = advantages[to_train, :]
+            dist, value = model(state)
+            entropy = dist.entropy().mean()
+            new_log_probs = dist.log_prob(action)
 
-        dist, value = model(state)
-        entropy = dist.entropy().mean()
-        new_log_probs = dist.log_prob(action)
-
-        ratio = (new_log_probs - old_log_prob).exp()
-        surr1 = ratio * advantage
-        surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * advantage
-        actor_loss = - torch.min(surr2, surr1).mean()
-        critic_loss = (return_ - value.squeeze(-1)) ** 2
-        critic_loss = critic_loss.mean()
-        loss = 0.5 * critic_loss + actor_loss - 0.001 * entropy
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            ratio = (new_log_probs - old_log_prob).exp()
+            surr1 = ratio * advantage
+            surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * advantage
+            actor_loss = - torch.min(surr2, surr1).mean()
+            critic_loss = (return_ - value.squeeze(-1)) ** 2
+            critic_loss = critic_loss.mean()
+            loss = 0.5 * critic_loss + actor_loss - 0.001 * entropy
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
 
 def test_env(model: ActorCritic):
