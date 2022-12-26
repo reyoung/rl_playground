@@ -39,6 +39,7 @@ class ActorCritic(torch.nn.Module):
             action = dist.sample().squeeze(0).item()
             return action
 
+
 def compute_return(final_value: torch.Tensor, values, rewards, masks, gamma=0.99, tau=0.95) -> torch.Tensor:
     values = values + [final_value]
     values = torch.stack(values).squeeze(-1)
@@ -69,36 +70,35 @@ def timeit(label: str):
 
 
 def do_ppo_update(model, optimizer,
-                  ppo_epochs, ppo_n_batch, ppo_batch_size, stats, actions, log_probs, returns, advantages, clip=0.2):
+                  ppo_batch_size, stats, actions, log_probs, returns, advantages, clip=0.2):
     n = stats.shape[0]
     ids = numpy.arange(n)
     numpy.random.shuffle(ids)
 
-    for _ in range(ppo_epochs):
-        for start in range(0, ppo_n_batch, ppo_batch_size):
-            end = start + ppo_batch_size
-            to_train = ids[start: end]
+    for start in range(0, n, ppo_batch_size):
+        end = start + ppo_batch_size
+        to_train = ids[start: end]
 
-            state = stats[to_train, :]
-            action = actions[to_train, :]
-            old_log_prob = log_probs[to_train, :]
-            return_ = returns[to_train, :]
-            advantage = advantages[to_train, :]
+        state = stats[to_train, :]
+        action = actions[to_train, :]
+        old_log_prob = log_probs[to_train, :]
+        return_ = returns[to_train, :]
+        advantage = advantages[to_train, :]
 
-            dist, value = model(state)
-            entropy = dist.entropy().mean()
-            new_log_probs = dist.log_prob(action)
+        dist, value = model(state)
+        entropy = dist.entropy().mean()
+        new_log_probs = dist.log_prob(action)
 
-            ratio = (new_log_probs - old_log_prob).exp()
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * advantage
-            actor_loss = - torch.min(surr2, surr1).mean()
-            critic_loss = (return_ - value.squeeze(-1)) ** 2
-            critic_loss = critic_loss.mean()
-            loss = 0.5 * critic_loss + actor_loss - 0.001 * entropy
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        ratio = (new_log_probs - old_log_prob).exp()
+        surr1 = ratio * advantage
+        surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * advantage
+        actor_loss = - torch.min(surr2, surr1).mean()
+        critic_loss = (return_ - value.squeeze(-1)) ** 2
+        critic_loss = critic_loss.mean()
+        loss = 0.5 * critic_loss + actor_loss - 0.001 * entropy
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
 
 def test_env(model: ActorCritic):
@@ -123,9 +123,7 @@ def main():
     model = ActorCritic(num_inputs=env.observation_space.shape[0], num_actions=env.action_space.n)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
-    ppo_epochs = 4
     ppo_mini_batch_size = 5
-    ppo_n_batch = 50
     num_steps = 1000
     state, _ = env.reset()
     for batch_id in tqdm.tqdm(range(5000), desc="batch"):
@@ -161,15 +159,14 @@ def main():
             actions = torch.stack(actions)
             states = torch.stack(states)
 
-        with timeit(f"ppo update {ppo_n_batch} batches"):
-            do_ppo_update(model, optimizer, ppo_epochs, ppo_n_batch, ppo_mini_batch_size,
+        with timeit(f"ppo update"):
+            do_ppo_update(model, optimizer, ppo_mini_batch_size,
                           states, actions, log_probs, returns, advantages)
 
         if (batch_id + 1) % 10 == 0:
             with torch.no_grad():
                 total_reward = test_env(model)
                 print(f"batch {batch_id + 1}, total reward {total_reward} / 10 episodes")
-
 
     state, _ = env.reset()
     episode = 0
