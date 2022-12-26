@@ -15,8 +15,7 @@ class ActorCritic(torch.nn.Module):
         self.actor = torch.nn.Sequential(
             torch.nn.Linear(num_inputs, 128),
             torch.nn.ReLU(),
-            torch.nn.Linear(128, num_actions),
-            torch.nn.Softmax(dim=0)
+            torch.nn.Linear(128, num_actions)
         )
         self.critic = torch.nn.Sequential(
             torch.nn.Linear(num_inputs, 128),
@@ -26,7 +25,7 @@ class ActorCritic(torch.nn.Module):
 
     def forward(self, x) -> Tuple[torch.distributions.Distribution, torch.Tensor]:
         value = self.critic(x)
-        probs = self.actor(x)
+        probs = torch.nn.functional.softmax(self.actor(x), dim=len(x.shape) - 1)
         dist = torch.distributions.Categorical(probs)
         return dist, value
 

@@ -18,8 +18,7 @@ class ActorCritic(torch.nn.Module):
         self.actor = torch.nn.Sequential(
             torch.nn.Linear(num_inputs, 128),
             torch.nn.ReLU(),
-            torch.nn.Linear(128, num_actions),
-            torch.nn.Softmax(dim=0)
+            torch.nn.Linear(128, num_actions)
         )
         self.critic = torch.nn.Sequential(
             torch.nn.Linear(num_inputs, 128),
@@ -30,13 +29,14 @@ class ActorCritic(torch.nn.Module):
     def forward(self, x) -> Tuple[torch.distributions.Distribution, torch.Tensor]:
         value = self.critic(x)
         probs = self.actor(x)
+        probs = torch.nn.functional.softmax(probs, dim=-1)
         dist = torch.distributions.Categorical(probs)
         return dist, value
 
     def act(self, x) -> int:
         with torch.no_grad():
-            dist, _ = self.forward(torch.tensor(x, dtype=torch.float32, device="cuda:0").unsqueeze(0))
-            action = dist.sample().squeeze(0).item()
+            probs = self.actor(torch.tensor(x, dtype=torch.float32, device=device))
+            action = torch.argmax(probs, 1).item()
             return action
 
 
@@ -44,17 +44,15 @@ def compute_return(final_value: torch.Tensor, values, rewards, masks, gamma=0.99
     values = values + [final_value]
     values = torch.stack(values).squeeze(-1)
     n = len(rewards)
-    gae = torch.zeros(dtype=torch.float32, size=(len(rewards[0]),), device="cuda:0")
-    rewards = torch.tensor(rewards, dtype=torch.float32, device="cuda:0")
-    masks = torch.tensor(masks, dtype=torch.float32, device="cuda:0")
+    gae = torch.zeros(dtype=torch.float32, size=(len(rewards[0]),), device=device)
+    rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+    masks = torch.tensor(masks, dtype=torch.float32, device=device)
     returns = []
     for step in reversed(range(n)):
         delta = rewards[step] + gamma * values[step + 1] * masks[step] - values[step]
         gae = delta + gamma * tau * masks[step] * gae
         returns.append(gae + values[step])
-
-    returns = list(reversed(returns))
-    returns = torch.stack(returns)
+    returns = torch.stack(returns[::-1])
     return returns
 
 
@@ -70,25 +68,30 @@ def timeit(label: str):
 
 
 def do_ppo_update(model, optimizer,
-                  ppo_batch_size, stats, actions, log_probs, returns, advantages, clip=0.2):
-    n = stats.shape[0]
-    ids = numpy.arange(n)
+                  ppo_batch_size, stats: torch.Tensor, actions, log_probs, returns, advantages, clip=0.2):
+    with torch.no_grad():
+        stats = torch.permute(stats, [1, 0, 2])
+        actions = torch.permute(actions, [1, 0])
+        log_probs = torch.permute(log_probs, [1, 0])
+        returns = torch.permute(returns, [1, 0])
+        advantages = torch.permute(advantages, [1, 0])
+
+    ids = numpy.arange(stats.shape[0])
     numpy.random.shuffle(ids)
+
     for _ in range(3):
-        for start in range(0, n, ppo_batch_size):
+        for start in range(0, stats.shape[0], ppo_batch_size):
             end = start + ppo_batch_size
             to_train = ids[start: end]
-
             state = stats[to_train, :]
             action = actions[to_train, :]
             old_log_prob = log_probs[to_train, :]
-            return_ = returns[to_train, :]
             advantage = advantages[to_train, :]
+            return_ = returns[to_train, :]
 
             dist, value = model(state)
             entropy = dist.entropy().mean()
             new_log_probs = dist.log_prob(action)
-
             ratio = (new_log_probs - old_log_prob).exp()
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * advantage
@@ -101,14 +104,23 @@ def do_ppo_update(model, optimizer,
             optimizer.step()
 
 
+def whiten(values, shift_mean=True):
+    """Whiten values."""
+    mean, var = torch.mean(values), torch.var(values)
+    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+    if not shift_mean:
+        whitened += mean
+    return whitened
+
+
 def test_env(model: ActorCritic):
-    env = gymnasium.make('CartPole-v1', render_mode="rgb_array")
+    env = envpool.make_gym("CartPole-v1", num_envs=1)
     episode_id = 0
     total_reward = 0
     state, _ = env.reset()
     while True:
         action = model.act(state)
-        state, reward, terminated, truncated, info = env.step(action)
+        state, reward, terminated, truncated, info = env.step(numpy.array([action]))
         total_reward += reward
         if terminated or truncated:
             if episode_id == 10:
@@ -119,11 +131,11 @@ def test_env(model: ActorCritic):
 
 
 def main():
-    env = envpool.make_gym("CartPole-v1", num_envs=64)
+    env = envpool.make_gym("CartPole-v1", num_envs=1024)
     model = ActorCritic(num_inputs=env.observation_space.shape[0], num_actions=env.action_space.n)
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
-    ppo_mini_batch_size = 5
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    ppo_mini_batch_size = 512
     num_steps = 1000
     state, _ = env.reset()
     for batch_id in tqdm.tqdm(range(5000), desc="batch"):
@@ -134,58 +146,44 @@ def main():
         rewards = []
         masks = []
         entropy = 0
-        with timeit(f"prepare num_steps {num_steps} data"):
-            for _ in range(num_steps):
-                state = torch.tensor(state).to(device)
-                states.append(state)
-                dist, value = model(state)
-                action = dist.sample()
-                actions.append(action)
-                state, reward, terminated, truncated, info = env.step(action.cpu().numpy())
-                log_prob = dist.log_prob(action)
-                entropy += dist.entropy().mean()
-                log_probs.append(log_prob)
-                values.append(value)
-                rewards.append(reward)
-                masks.append([not term and not trunc for term, trunc in zip(terminated, truncated)])
-
-        rewards = numpy.stack(rewards)
         with torch.no_grad():
+            total_reward = 0
+            with timeit(f"prepare num_steps {num_steps} data"):
+                model.eval()
+                for _ in range(num_steps):
+                    state = torch.tensor(state).to(device)
+                    states.append(state)
+                    dist, value = model(state)
+                    action = dist.sample()
+                    actions.append(action)
+                    state, reward, terminated, truncated, info = env.step(action.cpu().numpy())
+                    total_reward += reward.sum()
+                    log_prob = dist.log_prob(action)
+                    entropy += dist.entropy().mean()
+                    log_probs.append(log_prob)
+                    values.append(value)
+                    rewards.append(reward)
+                    masks.append([not term and not trunc for term, trunc in zip(terminated, truncated)])
+
+            rewards = numpy.stack(rewards)
             _, next_value = model(torch.tensor(state).to(device))
             returns = compute_return(next_value, values, rewards, masks)
             values = torch.stack(values).squeeze(-1)
             advantages = returns - values
+            advantages = whiten(advantages)
             log_probs = torch.stack(log_probs)
             actions = torch.stack(actions)
             states = torch.stack(states)
 
         with timeit(f"ppo update"):
+            model.train()
             do_ppo_update(model, optimizer, ppo_mini_batch_size,
                           states, actions, log_probs, returns, advantages)
 
         if (batch_id + 1) % 10 == 0:
             with torch.no_grad():
                 total_reward = test_env(model)
-                print(f"batch {batch_id + 1}, total reward {total_reward} / 10 episodes")
-
-    state, _ = env.reset()
-    episode = 0
-    frames = []
-    while True:
-        frames.append(env.render())
-        action = model.act(state)
-        state, reward, terminated, truncated, info = env.step(action)
-        if terminated or truncated:
-            frames.append(env.render())
-            state, _ = env.reset()
-            save_video(frames,
-                       "videos",
-                       episode_trigger=lambda *args: True,
-                       episode_index=episode,
-                       fps=env.metadata['render_fps'])
-            episode += 1
-            if episode == 10:
-                break
+                print(f"batch {batch_id + 1}, total reward {total_reward[0]} / 10 episodes")
 
 
 if __name__ == '__main__':
