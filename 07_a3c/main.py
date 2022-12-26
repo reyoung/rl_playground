@@ -223,7 +223,7 @@ def main():
         th_model.load_state_dict(model.state_dict())
         thread = threading.Thread(target=a2c_thread_main, args=(th_model, optimize_thread,
                                                                 5000, 1000,
-                                                                lambda bid: bid % (100 * num_a2c_thread) == bid * 100,
+                                                                lambda bid: bid % (100 * num_a2c_thread) == tid * 100,
                                                                 tid == 0
                                                                 ))
         thread.start()
@@ -234,6 +234,24 @@ def main():
     for th in threads:
         th.join()
 
+    state, _ = env.reset()
+    episode = 0
+    frames = []
+    while True:
+        frames.append(env.render())
+        action = model.act(state)
+        state, reward, terminated, truncated, info = env.step(action)
+        if terminated or truncated:
+            frames.append(env.render())
+            state, _ = env.reset()
+            save_video(frames,
+                       "videos",
+                       episode_trigger=lambda *args: True,
+                       episode_index=episode,
+                       fps=env.metadata['render_fps'])
+            episode += 1
+            if episode == 10:
+                break
 
 if __name__ == '__main__':
     main()
